@@ -6,12 +6,24 @@ merges to `main`. Update this file in the same commit as the change it describes
 
 ## [Unreleased] — v1.1 branch
 
+### Known gap
+- `quote_file_watcher.py` does not yet handle the "quick-reference lattice"
+  layout (same field repeated across several column blocks — see
+  `TRANSFORMATION_SPEC.md` §2a, e.g. Atos Medical price lists). It now fails
+  cleanly with a clear log message instead of crashing (see Fixed, below).
+  For vendors with this layout, use `transform_price_list.py` (manifest +
+  `layout: "lattice"`) instead until the watcher supports it natively.
+
 ### Fixed
 - `_normalize_uom()` no longer logs a spurious "Unrecognized UOM value" warning
   when a vendor file already uses a valid ANSI code (e.g. `EA`, `BX`, `CA`) —
   it now recognizes already-normalized codes as well as the full words
   (`each`, `box`, `case`) it previously required. Found via end-to-end smoke
   test.
+- Duplicate column headers (the lattice pattern above) previously crashed
+  with `ValueError: The truth value of a Series is ambiguous` deep inside
+  price-column disambiguation. Now detected upfront and skipped with a clear
+  explanatory log message pointing to the right tool for that layout.
 
 ### Added
 - `quote_file_watcher.py` — folder-watcher that ingests vendor files dropped into

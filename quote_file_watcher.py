@@ -947,6 +947,18 @@ def process_file(filepath: Path) -> bool:
             logging.warning("Skipping empty file: %s", filepath.name)
             return False
 
+        if df.columns.duplicated().any():
+            dup_names = sorted(set(df.columns[df.columns.duplicated()]))
+            logging.error(
+                "Skipping %s: repeated column headers %s detected. This looks like "
+                "a 'quick-reference lattice' layout (the same field repeated across "
+                "several column blocks, e.g. Atos Medical price lists) — the generic "
+                "watcher doesn't support that pattern yet. Use transform_price_list.py "
+                "(lattice layout, see TRANSFORMATION_SPEC.md §2a) for this vendor instead.",
+                filepath.name, dup_names,
+            )
+            return False
+
         # Rename incoming columns to template names
         col_map, map_info = _map_columns(df)
         logging.info("Column mapping: %s", col_map)
