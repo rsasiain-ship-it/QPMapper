@@ -6,6 +6,13 @@ merges to `main`. Update this file in the same commit as the change it describes
 
 ## [Unreleased] — v1.1 branch
 
+### Fixed
+- `_normalize_uom()` no longer logs a spurious "Unrecognized UOM value" warning
+  when a vendor file already uses a valid ANSI code (e.g. `EA`, `BX`, `CA`) —
+  it now recognizes already-normalized codes as well as the full words
+  (`each`, `box`, `case`) it previously required. Found via end-to-end smoke
+  test.
+
 ### Added
 - `quote_file_watcher.py` — folder-watcher that ingests vendor files dropped into
   a `RawFiles` folder and auto-maps them to the Quote Data Template schema.

@@ -629,10 +629,15 @@ UOM_MAP = {
 def _normalize_uom(value):
     if pd.isna(value):
         return value
-    normalized = UOM_MAP.get(str(value).strip().lower())
-    if normalized is None:
-        logging.warning("Unrecognized UOM value '%s' — left as-is", value)
-    return normalized if normalized else value
+    raw = str(value).strip()
+    normalized = UOM_MAP.get(raw.lower())
+    if normalized:
+        return normalized
+    if raw.upper() in UOM_MAP.values():
+        # Already an ANSI code (e.g. vendor file already says "EA") — pass through as-is
+        return raw.upper()
+    logging.warning("Unrecognized UOM value '%s' — left as-is", value)
+    return value
 
 
 def _clean_numeric(value):
