@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.claude/
+
+# Generated transform output — inputs/outputs are workbook-specific, not source
+*_corrected.xlsx
+*_corrected_summary.txt
