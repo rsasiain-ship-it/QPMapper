@@ -1,0 +1,6 @@
+pandas
+openpyxl
+watchdog
+openai
+pdfplumber
+pymupdf

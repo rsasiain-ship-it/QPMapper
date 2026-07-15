@@ -7,3 +7,17 @@ venv/
 # Generated transform output — inputs/outputs are workbook-specific, not source
 *_corrected.xlsx
 *_corrected_summary.txt
+
+# ---------------------------------------------------------------------------
+# Data security: this repo holds code, spec, and empty templates only.
+# Real vendor/customer pricing data must never enter git history.
+# ---------------------------------------------------------------------------
+RawFiles/
+CorrectedFiles/
+ManufacturerAlias*.xlsx
+ManufacturerAlias*.csv
+*.pdf
+.env
+*.env
+secrets.json
+config.local.json
