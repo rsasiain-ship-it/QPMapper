@@ -1,0 +1,47 @@
+#!/bin/sh
+# Pre-commit checks for QPMapper. See CONTRIBUTING.md for the full process
+# this backstops. Activate with: git config core.hooksPath hooks
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+fail=0
+
+# --- 1. Transform scripts changed without a CHANGELOG.md entry ------------
+touches_transform_logic=$(echo "$staged" | grep -E '^(transform_price_list\.py|quote_file_watcher\.py)$')
+touches_changelog=$(echo "$staged" | grep -E '^CHANGELOG\.md$')
+
+if [ -n "$touches_transform_logic" ] && [ -z "$touches_changelog" ]; then
+    echo "pre-commit: blocked — $touches_transform_logic changed but CHANGELOG.md was not."
+    echo "  Log what was added/removed/changed in CHANGELOG.md, in this same commit."
+    fail=1
+fi
+
+# --- 2. Obvious hardcoded secrets in staged content ------------------------
+secret_pattern='([A-Za-z_]*(KEY|TOKEN|SECRET|PASSWORD)[A-Za-z_]*)[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9+/_=.\-]{16,}["'"'"']'
+
+for f in $staged; do
+    case "$f" in
+        *.xlsx|*.xls|*.docx|*.pdf|*.png|*.jpg|*.jpeg) continue ;;
+    esac
+    content=$(git show ":$f" 2>/dev/null)
+    [ -z "$content" ] && continue
+    matches=$(echo "$content" | grep -inE "$secret_pattern" | grep -viE 'environ|getenv|os\.environ')
+    if [ -n "$matches" ]; then
+        echo "pre-commit: blocked — possible hardcoded secret in $f:"
+        echo "$matches" | sed 's/^/    /'
+        echo "  Read secrets from an environment variable instead of a literal."
+        fail=1
+    fi
+done
+
+# --- 3. Real-data filenames staged despite .gitignore ----------------------
+data_pattern='(^|/)RawFiles/|(^|/)CorrectedFiles/|ManufacturerAlias.*\.(xlsx|xls|csv)$|\.pdf$'
+data_matches=$(echo "$staged" | grep -iE "$data_pattern")
+if [ -n "$data_matches" ]; then
+    echo "pre-commit: blocked — file(s) matching the real-data pattern are staged:"
+    echo "$data_matches" | sed 's/^/    /'
+    echo "  This repo tracks code, spec, and empty templates only — see CONTRIBUTING.md."
+    echo "  If this is a false positive, review carefully before using git commit --no-verify."
+    fail=1
+fi
+
+exit $fail
