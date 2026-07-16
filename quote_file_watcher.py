@@ -201,8 +201,9 @@ COLUMN_PATTERNS = {
         "item number", "item num", "item no", "sku",
     ],
     "Manufacturer Catalog Description": ["description", "desc", "product name", "product"],
-    # UOM Quantity must come before Proposed UOM so "Contract UOM Conv" doesn't
-    # match the bare "uom" keyword and get misrouted to Proposed UOM.
+    # UOM Quantity and UOM Price must both come before the bare Proposed UOM
+    # check — otherwise "Contract UOM Conv" or "Unit Price" match the bare
+    # "uom"/"unit" keyword first and get misrouted to Proposed UOM.
     "Proposed UOM Quantity": [
         "uom qty", "uom quantity",
         "uom conv", "uom factor", "uom conversion",
@@ -211,11 +212,11 @@ COLUMN_PATTERNS = {
         "pack qty", "pack quantity",
         "qoe",
     ],
-    "Proposed UOM":                     ["puom", "uom", "unit of measure", "unit"],
     "Proposed UOM Price":               ["proposed pricing", "proposed price",
                                          "contract price", "contract pricing",
                                          "unit price", "unit pricing",
                                          "price", "pricing", "cost"],
+    "Proposed UOM":                     ["puom", "uom", "unit of measure", "unit"],
     "ManufacturerName":                 ["vendor name", "manufacturer name", "mfg name",
                                          "supplier name"],
 }
@@ -1067,6 +1068,125 @@ def _extract_pdf_pdfplumber(filepath: Path) -> "pd.DataFrame | None":
         return None
 
 
+def _split_camel_case(s: str) -> str:
+    """'ProposedUOMPrice' -> 'Proposed UOM Price' — splits lowercase-to-uppercase
+    boundaries and the tail end of an acronym run (UOM|Price)."""
+    s = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', s)
+    s = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', ' ', s)
+    return s
+
+
+def _extract_page_word_rows(page, row_tolerance: int = 3) -> list:
+    """Group a page's words into rows by y-position. Returns a list of
+    (top, [word_dict, ...]) ordered top-to-bottom, each row's words
+    left-to-right."""
+    words = page.extract_words()
+    if not words:
+        return []
+    words.sort(key=lambda w: (w['top'], w['x0']))
+    rows = []
+    for w in words:
+        if rows and abs(w['top'] - rows[-1][0]) <= row_tolerance:
+            rows[-1][1].append(w)
+        else:
+            rows.append((w['top'], [w]))
+    for _, row_words in rows:
+        row_words.sort(key=lambda w: w['x0'])
+    return rows
+
+
+def _words_to_header_table(rows: list) -> "tuple[list, list]":
+    """Given row-grouped words (first row = header), assign each later row's
+    words to the header column whose x-range contains them, joining
+    multi-word cell values. Returns (headers, [row_dict, ...]).
+    This is how a table without drawn gridlines gets reconstructed from
+    plain positioned text — pdfplumber's extract_tables() only finds
+    ruled/bordered tables, so this is the fallback for everything else."""
+    if len(rows) < 2:
+        return [], []
+    header_words = rows[0][1]
+    headers = [w['text'] for w in header_words]
+    bounds = [w['x0'] for w in header_words]
+
+    def assign(word_x0):
+        idx = 0
+        for i, b in enumerate(bounds):
+            if word_x0 >= b:
+                idx = i
+            else:
+                break
+        return idx
+
+    data_rows = []
+    for _, row_words in rows[1:]:
+        cells = {h: [] for h in headers}
+        for w in row_words:
+            cells[headers[assign(w['x0'])]].append(w['text'])
+        data_rows.append({h: ' '.join(v) for h, v in cells.items()})
+    return headers, data_rows
+
+
+def _extract_pdf_word_grid(filepath: Path) -> "pd.DataFrame | None":
+    """Reconstruct a table from a text-based PDF that has no drawn grid —
+    extract_tables() finds nothing, but the words are readable and
+    positioned in columns. Handles two shapes:
+      - a normal table spanning pages (same headers repeat) -> rows concatenate
+      - a wide table exported with each column-group as its own 'page'
+        (different, non-overlapping headers per page, same row count on
+        each) -> column groups are merged by row index
+    Returns None if neither shape matches, so the caller can fall back further."""
+    if not _PDFPLUMBER_AVAILABLE:
+        return None
+    try:
+        page_tables = []
+        with pdfplumber.open(str(filepath)) as pdf:
+            for page in pdf.pages:
+                rows = _extract_page_word_rows(page)
+                headers, data_rows = _words_to_header_table(rows)
+                if headers and data_rows:
+                    page_tables.append((headers, data_rows))
+    except Exception as exc:
+        logging.warning("Word-grid PDF extraction failed for %s: %s", filepath.name, exc)
+        return None
+
+    if not page_tables:
+        return None
+
+    if len(page_tables) == 1:
+        headers, data_rows = page_tables[0]
+    else:
+        first_headers = set(page_tables[0][0])
+        same_headers = all(set(hs) == first_headers for hs, _ in page_tables)
+        all_headers_flat = [h for hs, _ in page_tables for h in hs]
+        all_unique = len(set(all_headers_flat)) == len(all_headers_flat)
+        same_row_count = len({len(rs) for _, rs in page_tables}) == 1
+
+        if same_headers:
+            headers = page_tables[0][0]
+            data_rows = [r for _, rs in page_tables for r in rs]
+        elif all_unique and same_row_count:
+            headers = all_headers_flat
+            n_rows = len(page_tables[0][1])
+            data_rows = []
+            for i in range(n_rows):
+                merged = {}
+                for _, rs in page_tables:
+                    merged.update(rs[i])
+                data_rows.append(merged)
+        else:
+            logging.info(
+                "Word-grid extraction: pages have inconsistent headers/row counts "
+                "in %s — cannot reliably merge", filepath.name
+            )
+            return None
+
+    df = pd.DataFrame(data_rows, columns=headers)
+    df.columns = [_split_camel_case(c).strip() for c in df.columns]
+    logging.info("Word-grid extraction: %d row(s) x %d col(s) from %s across %d page(s)",
+                 len(df), len(df.columns), filepath.name, len(page_tables))
+    return df
+
+
 def _extract_pdf_ai_vision(filepath: Path) -> "pd.DataFrame | None":
     """Convert PDF pages to images and ask GPT-5.4 to extract the table as CSV.
     Fallback for scanned PDFs and layouts where pdfplumber finds nothing."""
@@ -1156,18 +1276,24 @@ def _extract_pdf_ai_vision(filepath: Path) -> "pd.DataFrame | None":
 
 
 def _extract_pdf(filepath: Path) -> "tuple[pd.DataFrame | None, str]":
-    """Orchestrate PDF extraction: pdfplumber first, AI vision fallback.
+    """Orchestrate PDF extraction: pdfplumber grid table, then pdfplumber
+    word-position reconstruction (no AI, deterministic), then AI vision.
 
     Returns (df, method) where:
-      'pdfplumber' — df is raw (header=None style), pass to _normalize_layout
-      'ai_vision'  — df already has column headers, skip normalization
-      'failed'     — df is None, file could not be extracted
+      'pdfplumber'        — df is raw (header=None style), pass to _normalize_layout
+      'pdfplumber_words'  — df already has column headers, skip normalization
+      'ai_vision'         — df already has column headers, skip normalization
+      'failed'            — df is None, file could not be extracted
     """
     if _PDFPLUMBER_AVAILABLE:
         df = _extract_pdf_pdfplumber(filepath)
         if df is not None:
             return df, "pdfplumber"
-        logging.info("pdfplumber found no tables — trying AI vision fallback")
+        logging.info("pdfplumber found no ruled tables — trying word-position extraction")
+        df = _extract_pdf_word_grid(filepath)
+        if df is not None:
+            return df, "pdfplumber_words"
+        logging.info("Word-position extraction found nothing — trying AI vision fallback")
     else:
         logging.warning("pdfplumber not installed — trying AI vision. "
                         "Install with: pip install pdfplumber")

@@ -7,6 +7,17 @@ merges to `main`. Update this file in the same commit as the change it describes
 ## [Unreleased] — v1.1 branch
 
 ### Added
+- Word-position PDF table reconstruction (`_extract_pdf_word_grid`), a new
+  deterministic (non-AI) extraction layer between the pdfplumber ruled-table
+  pass and the AI vision fallback. Handles text-based PDFs with no drawn
+  grid: assigns words to columns via header x-position, and merges either
+  (a) a table spanning pages with a repeated header — rows concatenate, or
+  (b) a wide table exported with each column-group as its own "page" —
+  disjoint headers, same row count, merged by row index. Verified against a
+  real file (`MT - Billings Clinic ... Pocket Mask.pdf`) that pdfplumber's
+  table-grid pass and pdfplumber's raw text both saw fine but couldn't
+  reassemble: 3 pages, 3 columns each, same 3 rows — reconstructed
+  correctly into one 7-column, 3-row table with zero AI involvement.
 - `quote_file_watcher.py` — folder-watcher that ingests vendor files dropped into
   a `RawFiles` folder and auto-maps them to the Quote Data Template schema.
   Unlike `transform_price_list.py`, it does not require a per-sheet manifest:
@@ -36,6 +47,15 @@ merges to `main`. Update this file in the same commit as the change it describes
   matching `TEMPLATE_COLUMNS` / the spec's output schema exactly.
 
 ### Fixed
+- `_map_columns()`: a price column named with "unit" (e.g. `Unit Price`,
+  extremely common) could get misassigned to `Proposed UOM` instead of
+  `Proposed UOM Price`, because `Proposed UOM`'s bare `"unit"` keyword was
+  checked before `Proposed UOM Price`'s keywords in `COLUMN_PATTERNS` — the
+  same class of bug the existing UOM-Quantity-before-UOM ordering already
+  guarded against, just not applied to Price. It only "worked" by accident
+  when a separate bare `UOM` column happened to appear earlier in the file
+  and claim the target first. Reordered so UOM Price is checked before the
+  bare UOM keyword; verified correct regardless of column order.
 - `_normalize_uom()` no longer logs a spurious "Unrecognized UOM value" warning
   when a vendor file already uses a valid ANSI code (e.g. `EA`, `BX`, `CA`) —
   it now recognizes already-normalized codes as well as the full words
