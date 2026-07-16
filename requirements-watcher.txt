@@ -4,3 +4,4 @@ watchdog
 openai
 pdfplumber
 pymupdf
+azure-identity

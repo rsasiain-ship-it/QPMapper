@@ -39,28 +39,98 @@ try:
 except ImportError:
     _PYMUPDF_AVAILABLE = False
 
+try:
+    from azure.identity import DefaultAzureCredential
+    _AZURE_IDENTITY_AVAILABLE = True
+except ImportError:
+    _AZURE_IDENTITY_AVAILABLE = False
+    logging.warning("azure-identity package not installed — Azure AD auth unavailable. "
+                    "Run: pip install azure-identity")
+
 # ── Azure OpenAI config (dev POC) ─────────────────────────────────────────────
-# AZURE_API_KEY is read from the environment, never hardcoded — set
-# AZURE_OPENAI_API_KEY before running the watcher to enable AI fallback.
+# This resource has key-based auth disabled server-side (BroadJump IT policy),
+# so Azure AD (Entra ID) auth is the primary path: sign in locally (e.g.
+# `az login`) with an account that has a role assigned on the Azure AI
+# Foundry resource, and DefaultAzureCredential picks that up automatically.
+# AZURE_OPENAI_API_KEY (static key) is kept only as a fallback in case a
+# different environment has key auth enabled — never hardcode it.
 AZURE_ENDPOINT   = "https://broadjump-foundry-dev.services.ai.azure.com/openai/v1"
 AZURE_API_KEY    = os.environ.get("AZURE_OPENAI_API_KEY", "")
 AZURE_DEPLOYMENT = "gpt-5.4"
 AZURE_API_VER    = "2025-01-01-preview"
+AZURE_AD_SCOPE   = "https://cognitiveservices.azure.com/.default"
+_TOKEN_REFRESH_MARGIN_SEC = 60
 
-_azure_client = None   # initialised lazily on first use
+_azure_client = None        # OpenAI client, created once; api_key refreshed in place for AD auth
+_azure_credential = None    # DefaultAzureCredential instance, or False if setup failed
+_azure_token_expiry = 0     # epoch seconds the current AD bearer token expires
+
+
+def _refresh_azure_ad_token() -> bool:
+    """Fetch/refresh an Azure AD bearer token onto the shared client's api_key.
+    Returns True if the client now holds a fresh-enough token."""
+    global _azure_credential, _azure_client, _azure_token_expiry
+
+    if _azure_credential is None:
+        try:
+            _azure_credential = DefaultAzureCredential()
+        except Exception as exc:
+            logging.warning("Azure AD credential setup failed: %s", exc)
+            _azure_credential = False
+            return False
+
+    if _azure_credential is False:
+        return False
+
+    if _azure_client is not None and time.time() < _azure_token_expiry - _TOKEN_REFRESH_MARGIN_SEC:
+        return True  # current token still fresh enough
+
+    try:
+        token = _azure_credential.get_token(AZURE_AD_SCOPE)
+    except Exception as exc:
+        logging.warning(
+            "Azure AD token fetch failed: %s. Sign in (e.g. 'az login') and "
+            "confirm your account has a role assigned on the Azure AI Foundry "
+            "resource.", exc
+        )
+        return _azure_client is not None  # keep using a stale client if we have one
+
+    _azure_token_expiry = token.expires_on
+    if _azure_client is None:
+        _azure_client = OpenAI(base_url=AZURE_ENDPOINT, api_key=token.token)
+    else:
+        _azure_client.api_key = token.token
+    return True
+
 
 def _get_ai_client():
-    """Return the OpenAI client pointed at Azure AI Foundry, creating it on first call.
-    Returns None (AI fallback disabled) if AZURE_OPENAI_API_KEY isn't set."""
+    """Return the OpenAI client pointed at Azure AI Foundry, creating it on first
+    call. Prefers Azure AD (Entra ID) auth, refreshing the bearer token as it
+    nears expiry; falls back to a static AZURE_OPENAI_API_KEY only if Azure AD
+    auth isn't available. Returns None if neither works — AI features degrade
+    gracefully rather than crashing."""
     global _azure_client
-    if _azure_client is None and _OPENAI_AVAILABLE and AZURE_API_KEY:
-        _azure_client = OpenAI(
-            base_url=AZURE_ENDPOINT,
-            api_key=AZURE_API_KEY,
-        )
-    elif _azure_client is None and _OPENAI_AVAILABLE and not AZURE_API_KEY:
-        logging.warning("AZURE_OPENAI_API_KEY not set — AI fallback disabled.")
-    return _azure_client
+
+    if not _OPENAI_AVAILABLE:
+        return None
+
+    if _AZURE_IDENTITY_AVAILABLE and _refresh_azure_ad_token():
+        return _azure_client
+
+    if _azure_client is not None:
+        return _azure_client  # already-created client (e.g. stale AD token) — better than nothing
+
+    if AZURE_API_KEY:
+        logging.info("Azure AD auth unavailable — falling back to static AZURE_OPENAI_API_KEY.")
+        _azure_client = OpenAI(base_url=AZURE_ENDPOINT, api_key=AZURE_API_KEY)
+        return _azure_client
+
+    logging.warning(
+        "No usable Azure OpenAI auth — AI fallback disabled. Sign in for Azure "
+        "AD access (e.g. 'az login', with a role assigned on the Foundry "
+        "resource) or set AZURE_OPENAI_API_KEY."
+    )
+    return None
 
 
 def _ask_ai_to_classify_column(col_name: str, sample_values: list) -> tuple[str, str]:

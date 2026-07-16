@@ -47,6 +47,17 @@ merges to `main`. Update this file in the same commit as the change it describes
   `ValueError: The truth value of a Series is ambiguous` deep inside
   price-column disambiguation.
 
+### Changed
+- `_get_ai_client()` now authenticates via Azure AD (Entra ID) first, using
+  `DefaultAzureCredential` and refreshing the bearer token as it nears
+  expiry. Falls back to a static `AZURE_OPENAI_API_KEY` only if Azure AD
+  auth isn't available, and to `None` (AI features disabled, no crash) if
+  neither works. Driven by BroadJump IT disabling key-based auth on the
+  `broadjump-foundry-dev` resource (`AuthenticationTypeDisabled` on every
+  AI call). Requires the `azure-identity` package (added to
+  `requirements-watcher.txt`) and a signed-in credential source (e.g.
+  `az login`) with a role assigned on the Foundry resource.
+
 ### Known gap
 - Manufacturer-name alias lookup can false-match on filename substrings
   (e.g. `AtosMedInc_PriceList.xlsx` matched the alias `"MEDINC"` and resolved
