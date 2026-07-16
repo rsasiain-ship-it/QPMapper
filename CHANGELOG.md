@@ -6,25 +6,6 @@ merges to `main`. Update this file in the same commit as the change it describes
 
 ## [Unreleased] — v1.1 branch
 
-### Known gap
-- `quote_file_watcher.py` does not yet handle the "quick-reference lattice"
-  layout (same field repeated across several column blocks — see
-  `TRANSFORMATION_SPEC.md` §2a, e.g. Atos Medical price lists). It now fails
-  cleanly with a clear log message instead of crashing (see Fixed, below).
-  For vendors with this layout, use `transform_price_list.py` (manifest +
-  `layout: "lattice"`) instead until the watcher supports it natively.
-
-### Fixed
-- `_normalize_uom()` no longer logs a spurious "Unrecognized UOM value" warning
-  when a vendor file already uses a valid ANSI code (e.g. `EA`, `BX`, `CA`) —
-  it now recognizes already-normalized codes as well as the full words
-  (`each`, `box`, `case`) it previously required. Found via end-to-end smoke
-  test.
-- Duplicate column headers (the lattice pattern above) previously crashed
-  with `ValueError: The truth value of a Series is ambiguous` deep inside
-  price-column disambiguation. Now detected upfront and skipped with a clear
-  explanatory log message pointing to the right tool for that layout.
-
 ### Added
 - `quote_file_watcher.py` — folder-watcher that ingests vendor files dropped into
   a `RawFiles` folder and auto-maps them to the Quote Data Template schema.
@@ -33,6 +14,14 @@ merges to `main`. Update this file in the same commit as the change it describes
   columns via keyword + content-based heuristics, and falls back to Azure
   OpenAI for columns it can't otherwise classify or to disambiguate multiple
   price-like columns.
+- Generic lattice-layout support: detects the repeated Ref#/Price
+  column-block pattern (spec §2a) dynamically from the header row — no
+  per-vendor hardcoded column positions required — builds the authoritative
+  part+price universe from every block, then left-joins Description/UOM from
+  any detailed section found lower on the sheet. Verified against the real
+  Atos Medical price list: found the same 6 column blocks and 300 parts (290
+  enriched) that `transform_price_list.py`'s hardcoded positions find for
+  that same file.
 - PDF ingestion (`.pdf` support) — text-based PDFs via `pdfplumber`, with an
   AI-vision fallback (renders pages as images, asks the model to extract the
   table) for scanned/complex PDFs.
@@ -45,6 +34,25 @@ merges to `main`. Update this file in the same commit as the change it describes
   on a new machine.
 - `QuoteTemplate.xlsx` — canonical empty output template (headers only),
   matching `TEMPLATE_COLUMNS` / the spec's output schema exactly.
+
+### Fixed
+- `_normalize_uom()` no longer logs a spurious "Unrecognized UOM value" warning
+  when a vendor file already uses a valid ANSI code (e.g. `EA`, `BX`, `CA`) —
+  it now recognizes already-normalized codes as well as the full words
+  (`each`, `box`, `case`) it previously required. Found via end-to-end smoke
+  test.
+- Duplicate column headers that don't match the known lattice pattern now
+  fail cleanly with an explanatory log message (pointing to
+  `transform_price_list.py`) instead of crashing with an opaque
+  `ValueError: The truth value of a Series is ambiguous` deep inside
+  price-column disambiguation.
+
+### Known gap
+- Manufacturer-name alias lookup can false-match on filename substrings
+  (e.g. `AtosMedInc_PriceList.xlsx` matched the alias `"MEDINC"` and resolved
+  to "Medtronic" instead of "Atos Medical"). Needs a fix before this is
+  trusted on filenames with ambiguous substrings — verify ManufacturerName on
+  every output until resolved.
 
 ### Security
 - Azure OpenAI API key removed from source; the script now reads

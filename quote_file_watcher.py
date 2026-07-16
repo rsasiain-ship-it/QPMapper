@@ -650,6 +650,207 @@ def _clean_numeric(value):
         return value
 
 
+# ---------------------------------------------------------------------------
+# Lattice layout detection & parsing — handles vendor files where the same
+# Ref#/Price fields repeat across several side-by-side column blocks on the
+# same rows (a "quick reference" price list), instead of one row per part.
+# See TRANSFORMATION_SPEC.md §2a. Unlike transform_price_list.py's hardcoded
+# per-vendor block positions, this detects the blocks dynamically from the
+# header row so it isn't tied to one specific file's column layout.
+# ---------------------------------------------------------------------------
+
+REF_HEADER_RE = re.compile(r'\bref\s*#?\b', re.IGNORECASE)
+LATTICE_NUM_RE = re.compile(r'^\$?\d[\d,]*\.?\d*$')
+
+
+def _is_ref_header(cell) -> bool:
+    if pd.isna(cell):
+        return False
+    return bool(REF_HEADER_RE.search(str(cell)))
+
+
+def _is_price_header(cell) -> bool:
+    if pd.isna(cell):
+        return False
+    c = str(cell).lower()
+    if any(ex in c for ex in PRICE_EXCLUSION_KEYWORDS):
+        return False
+    return any(kw in c for kw in COLUMN_PATTERNS["Proposed UOM Price"])
+
+
+def _is_description_header(cell) -> bool:
+    if pd.isna(cell):
+        return False
+    c = str(cell).strip().lower()
+    return "description" in c or c == "desc"
+
+
+def _is_uom_header(cell) -> bool:
+    if pd.isna(cell):
+        return False
+    c = str(cell).strip().lower()
+    return c in ("u/m", "uom", "unit", "unit of measure") or "u/m" in c
+
+
+def _lattice_is_price(p) -> bool:
+    if pd.isna(p):
+        return False
+    if isinstance(p, (int, float)):
+        return True
+    return bool(LATTICE_NUM_RE.match(str(p).strip()))
+
+
+def _lattice_clean_ref(raw) -> str:
+    if pd.isna(raw):
+        return ""
+    s = str(raw).strip()
+    return re.sub(r'^REF\s+', '', s, flags=re.IGNORECASE)
+
+
+def _lattice_normalize_unit(u: str) -> str:
+    if not u:
+        return ""
+    l = str(u).lower()
+    if l.startswith("pc"):
+        return "PC"
+    if l.startswith("set"):
+        return "SET"
+    if l.startswith("kit"):
+        return "KIT"
+    if l.startswith("box"):
+        return "BOX"
+    return str(u).upper()
+
+
+def _lattice_split_uom(uom_str):
+    """'1 pc' -> (1, 'PC'); 'BOX' -> ('', 'BOX')"""
+    if not uom_str:
+        return "", ""
+    m = re.match(r'^(\d+)\s*(.*)$', str(uom_str).strip())
+    if m:
+        qty = int(m.group(1))
+        unit = m.group(2).strip() or uom_str
+    else:
+        qty, unit = "", uom_str
+    return qty, _lattice_normalize_unit(unit)
+
+
+def _detect_lattice_blocks(header_row: list) -> list:
+    """Given one row's raw cell values, find repeated (ref_idx, price_idx)
+    column blocks. Returns [] if this doesn't look like a lattice header —
+    at least 2 repeated Ref#-like columns are required to call it a lattice
+    rather than a coincidental single Ref#/Price pair."""
+    ref_positions = [i for i, c in enumerate(header_row) if _is_ref_header(c)]
+    if len(ref_positions) < 2:
+        return []
+    blocks = []
+    for n, ref_idx in enumerate(ref_positions):
+        next_ref = ref_positions[n + 1] if n + 1 < len(ref_positions) else len(header_row)
+        price_idx = next(
+            (i for i in range(ref_idx + 1, min(next_ref, ref_idx + 6))
+             if i < len(header_row) and _is_price_header(header_row[i])),
+            None,
+        )
+        if price_idx is not None:
+            blocks.append((ref_idx, price_idx))
+    return blocks if len(blocks) >= 2 else []
+
+
+def _find_lattice_detail_sections(df_raw, start_idx: int) -> list:
+    """Find header rows for a lower 'detailed' section that repeats
+    periodically and carries Description/UOM, keyed on Ref# (spec §2a).
+    Returns a list of dicts: {row_idx, ref_idx, description_idx, uom_idx}."""
+    sections = []
+    for idx in range(start_idx, len(df_raw)):
+        row = df_raw.iloc[idx].tolist()
+        ref_idx = next((i for i, c in enumerate(row) if _is_ref_header(c)), None)
+        desc_idx = next((i for i, c in enumerate(row) if _is_description_header(c)), None)
+        if ref_idx is not None and desc_idx is not None:
+            uom_idx = next((i for i, c in enumerate(row) if _is_uom_header(c)), None)
+            sections.append({"row_idx": idx, "ref_idx": ref_idx,
+                              "description_idx": desc_idx, "uom_idx": uom_idx})
+    return sections
+
+
+def _parse_lattice_sheet(df_raw, header_idx: int, blocks: list):
+    """Build the authoritative (ref -> price) universe from every lattice
+    block, then left-join Description/UOM from any detailed section found
+    lower on the sheet. Returns (df, info) — df already shaped to
+    TEMPLATE_COLUMNS (ManufacturerName left blank, filled by the usual
+    filename/alias fallback later in process_file)."""
+    lattice_pairs = {}
+    for _, row in df_raw.iloc[header_idx + 1:].iterrows():
+        values = row.tolist()
+        for ref_idx, price_idx in blocks:
+            if ref_idx >= len(values) or price_idx >= len(values):
+                continue
+            ref, price = values[ref_idx], values[price_idx]
+            if pd.isna(ref) or not _lattice_is_price(price):
+                continue
+            ref_clean = _lattice_clean_ref(ref)
+            if ref_clean:
+                lattice_pairs[ref_clean] = _clean_numeric(price)
+
+    detail_map = {}
+    sections = _find_lattice_detail_sections(df_raw, header_idx + 1)
+    for i, section in enumerate(sections):
+        end = sections[i + 1]["row_idx"] if i + 1 < len(sections) else len(df_raw)
+        for r in range(section["row_idx"] + 1, end):
+            row = df_raw.iloc[r].tolist()
+            ref_idx = section["ref_idx"]
+            if ref_idx >= len(row) or pd.isna(row[ref_idx]):
+                continue
+            ref_clean = _lattice_clean_ref(row[ref_idx])
+            if not ref_clean or ref_clean not in lattice_pairs:
+                continue  # detailed section only enriches parts already in the lattice
+            desc_idx, uom_idx = section["description_idx"], section["uom_idx"]
+            description = row[desc_idx] if desc_idx is not None and desc_idx < len(row) else None
+            uom_raw = row[uom_idx] if uom_idx is not None and uom_idx < len(row) else None
+            if not pd.isna(description) or not pd.isna(uom_raw):
+                detail_map[ref_clean] = {"description": description, "uom": uom_raw}
+
+    out_rows = []
+    enriched = 0
+    for ref_clean, price in lattice_pairs.items():
+        detail = detail_map.get(ref_clean, {})
+        if detail:
+            enriched += 1
+        uom_qty, uom_unit = _lattice_split_uom(detail.get("uom") or "")
+        description = detail.get("description")
+        out_rows.append({
+            "ManufacturerName": None,
+            "Manufacturer Catalog Number": ref_clean,
+            "Manufacturer Catalog Description":
+                str(description).strip() if not pd.isna(description) else "",
+            "Proposed UOM": uom_unit,
+            "Proposed UOM Quantity": uom_qty,
+            "Proposed UOM Price": price,
+            "Proposed Purchase Quantity": None,
+        })
+    df = pd.DataFrame(out_rows, columns=TEMPLATE_COLUMNS)
+    info = {
+        "blocks": blocks,
+        "detail_sections_found": len(sections),
+        "parts_enriched": enriched,
+        "parts_total": len(out_rows),
+    }
+    return df, info
+
+
+def _try_parse_lattice(df_raw):
+    """If df_raw's detected header row shows the repeated Ref#/Price block
+    pattern, parse it as a lattice layout. Returns (df, info), or None if
+    this file doesn't look like a lattice."""
+    header_idx = _find_header_row(df_raw)
+    header_row = df_raw.iloc[header_idx].tolist()
+    blocks = _detect_lattice_blocks(header_row)
+    if not blocks:
+        return None
+    logging.info("Lattice layout detected: %d repeated Ref#/Price block(s) at row %d",
+                 len(blocks), header_idx)
+    return _parse_lattice_sheet(df_raw, header_idx, blocks)
+
+
 def _load_manufacturer_aliases(folder: Path) -> list:
     """Read the manufacturer alias crosswalk from the watched folder.
     Column A = alias string to search in filename, Column B = clean name.
@@ -925,6 +1126,7 @@ def process_file(filepath: Path) -> bool:
         time.sleep(0.5)
 
         pdf_extraction_method = None
+        lattice_info = None
 
         if ext == ".pdf":
             df_raw, pdf_extraction_method = _extract_pdf(filepath)
@@ -941,28 +1143,43 @@ def process_file(filepath: Path) -> bool:
         else:
             sheet = _best_sheet(filepath)
             df_raw = pd.read_excel(filepath, sheet_name=sheet, header=None)
-            df = _normalize_layout(df_raw)
+            lattice_result = _try_parse_lattice(df_raw)
+            if lattice_result is not None:
+                df, lattice_info = lattice_result
+            else:
+                df = _normalize_layout(df_raw)
 
         if df.empty:
             logging.warning("Skipping empty file: %s", filepath.name)
             return False
 
-        if df.columns.duplicated().any():
+        if lattice_info is None and df.columns.duplicated().any():
             dup_names = sorted(set(df.columns[df.columns.duplicated()]))
             logging.error(
-                "Skipping %s: repeated column headers %s detected. This looks like "
-                "a 'quick-reference lattice' layout (the same field repeated across "
-                "several column blocks, e.g. Atos Medical price lists) — the generic "
-                "watcher doesn't support that pattern yet. Use transform_price_list.py "
-                "(lattice layout, see TRANSFORMATION_SPEC.md §2a) for this vendor instead.",
+                "Skipping %s: repeated column headers %s detected, but this doesn't "
+                "match the known lattice pattern (repeated Ref#/Price column blocks — "
+                "see TRANSFORMATION_SPEC.md §2a). Try transform_price_list.py with an "
+                "explicit layout mapping instead.",
                 filepath.name, dup_names,
             )
             return False
 
-        # Rename incoming columns to template names
-        col_map, map_info = _map_columns(df)
-        logging.info("Column mapping: %s", col_map)
-        df = df.rename(columns=col_map)
+        if lattice_info is not None:
+            logging.info(
+                "Lattice parse: %d block(s), %d part(s) found, %d enriched from %d "
+                "detailed section(s)",
+                len(lattice_info["blocks"]), lattice_info["parts_total"],
+                lattice_info["parts_enriched"], lattice_info["detail_sections_found"],
+            )
+            col_map, map_info = {}, {
+                "ignored": [], "ai_mapped": [], "ai_calls": [],
+                "price_disambiguation_log": [], "lattice_info": lattice_info,
+            }
+        else:
+            # Rename incoming columns to template names
+            col_map, map_info = _map_columns(df)
+            logging.info("Column mapping: %s", col_map)
+            df = df.rename(columns=col_map)
 
         # If no ManufacturerName column was found (or it's entirely blank),
         # try to derive it from the filename using the alias crosswalk
@@ -979,9 +1196,10 @@ def process_file(filepath: Path) -> bool:
                 mfr_source = "not found — left blank"
                 logging.warning("No manufacturer name found for %s", filepath.name)
 
-        # Normalize UOM to ANSI 2-char codes
+        # Normalize UOM to ANSI 2-char codes (skip for lattice rows — already
+        # normalized to PC/SET/KIT/BOX by the lattice-specific parser, spec §5)
         uom_change_count = 0
-        if "Proposed UOM" in df.columns:
+        if lattice_info is None and "Proposed UOM" in df.columns:
             uom_before = df["Proposed UOM"].copy()
             df["Proposed UOM"] = df["Proposed UOM"].apply(_normalize_uom)
             uom_change_count = int((uom_before != df["Proposed UOM"]).sum())
@@ -1055,17 +1273,29 @@ def process_file(filepath: Path) -> bool:
                 )
             summary.append("")
 
-        summary += [
-            thin,
-            "  COLUMN MAPPING",
-            thin,
-        ]
-        if col_map:
-            for src, tgt in col_map.items():
-                ai_tag = "  [AI]" if src in map_info["ai_mapped"] else ""
-                summary.append(f"    {src:<35} ->  {tgt}{ai_tag}")
+        if map_info.get("lattice_info"):
+            li = map_info["lattice_info"]
+            summary += [
+                thin,
+                "  LATTICE LAYOUT (positional, no column mapping — spec §2a)",
+                thin,
+                f"    Repeated Ref#/Price blocks: {len(li['blocks'])} at columns {li['blocks']}",
+                f"    Parts found (lattice = authoritative universe): {li['parts_total']}",
+                f"    Detailed section(s) found lower on the sheet: {li['detail_sections_found']}",
+                f"    Parts enriched with Description/UOM: {li['parts_enriched']}",
+            ]
         else:
-            summary.append("    (no columns mapped)")
+            summary += [
+                thin,
+                "  COLUMN MAPPING",
+                thin,
+            ]
+            if col_map:
+                for src, tgt in col_map.items():
+                    ai_tag = "  [AI]" if src in map_info["ai_mapped"] else ""
+                    summary.append(f"    {src:<35} ->  {tgt}{ai_tag}")
+            else:
+                summary.append("    (no columns mapped)")
 
         if map_info["ignored"]:
             summary += ["", f"  Ignored (not mapped to any template field):"]
